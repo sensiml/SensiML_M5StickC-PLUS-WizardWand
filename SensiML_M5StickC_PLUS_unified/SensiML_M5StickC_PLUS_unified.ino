@@ -1,7 +1,7 @@
 /* ------------------------------------------------------------------------------------------------------------------------------------------------------
-*   SensiML M5StickC PLUS Unified Demo Game/DCL/Test Application - Arduino M5StickC PLUS (ESP32-PICO)
-*   Version: 0.91
-*   Date: February 22, 2023
+*   SensiML M5StickC PLUS Unified Demo Game/DCL Application - Arduino M5StickC PLUS (ESP32-PICO)
+*   Version: 1.01
+*   Date: June 5, 2023
 *   Author: Chris Rogers
 *   Purpose: Example demonstrating integration of SensiML Knowledge Pack into ESP32 WiFi enabled connected IoT device application
 *            Provide multi-mode operation for raw IMU data capture mode and example gesture recognition 'Wizard Wand' game with integrated ML model
@@ -40,25 +40,28 @@
 #include <WiFi.h> // Tested on version 1.2.7
 #include <Adafruit_NeoPixel.h>  //Tested on version 1.10.7
 #include <EEPROM.h>
-#include "src/includes/ww_lcd_bitmaps.h"
+#include "src/includes/m5_lcd_bitmaps.h"
 #include "src/includes/ww_melodies.h"
-#include "src/kb/kb.h"
+#include <kb.h>
 #define NUM_PIXELS 7
 #define NEOPIXEL_PIN G33
 #define BUTTON_A G37
 #define BUTTON_B G39
 #define BUZZER_PIN G26
-#define GAME_MODE 0   //Play Wizard game > Supports /gamestatus and /reset endpoints
-#define DCL_MODE 1    //Stream raw sensor data to DCL and/or Open Gateway > Supports /config and /stream endpoints
-#define TEST_MODE 2   //To do: Stream raw sensor data to DCL and KP results > Supports /config, /stream, /disconnect and /results endpoints
+#define GAME_MODE 0       //Play Wizard game > Supports /gamestatus and /reset endpoints
+#define DCL_MODE 1        //Stream raw sensor data to DCL and/or Open Gateway > Supports /config and /stream endpoints
+#define DCL_MODE_NOGYRO 2 //Same as DCL_MODE but with only accelerometer data, no gyro
+#define DCL_MODE_AUDIO 3  //To do: Support for audio data collection
+#define TEST_MODE 10      //To do: Stream raw sensor data to DCL and KP results > Supports /config, /stream, /disconnect and /results endpoints
 #define APP_TITLE "SensiML M5StickC+ FW"
-#define APP_VERSION "Version 0.91"
+#define APP_VERSION "Version 1.01"
 
+//MPU6886 IMU sample rate declarations
 const int SAMPLE_SELECT[] = {99,19,9,7,4,3,1,0};
 int sampleRate = M5.IMU.ODR_250Hz;  // valid MStickC+ w/ FIFO modified lib are ODR_10Hz (99), ODR_50Hz (19), ODR_100Hz (9), ODR_125Hz (7), ODR_200Hz (4), ODR_250Hz (3), ODR_500Hz (1), ODR_1kHz (0)
 
 // Sensor Data Array and SSFv1 HTTP streaming format declarations
-const int CHANNELS_PER_SAMPLE = 7;  // for applications using the onboard IMU motion sensor MPU6886 -> accel_X, accel_Y, accel_Z, gyro_X, gyro_y, gyro_Z, target_label_class
+int CHANNELS_PER_SAMPLE = 7;  // for applications using the onboard IMU motion sensor MPU6886 -> accel_X, accel_Y, accel_Z, gyro_x, gyro_y, gyro_Z, trigger
 int SAMPLES_PER_PACKET = 100 / (sampleRate + 1);  //Adjust samples/packet to yield 10 packets/sec stream no matter the sample rate
 int PACKET_SIZE = SAMPLES_PER_PACKET * CHANNELS_PER_SAMPLE; // accelx,y,z + gyrox,y,z + target gesture class number from BtnA trigger
 char dataPacket[700 * 2];  // Define as maximum array size for 1kHz sample rate
@@ -86,6 +89,7 @@ int16_t gyroZ = 0;
 // HTTP timer declarations
 const long TIMEOUT_TIME = 2000; // 2sec TCP/HTTP session timeout
 unsigned long httpTime;
+
 // HTTP state variabbles
 String header = "";
 int crcount = 0;
@@ -112,25 +116,27 @@ WiFiClient client;   // Instantiate WiFi client
 // IMU sample array
 int16_t pSample[7];
 
-// Game Model declarations
+// GAME Mode declarations
 const char gestureset[11] = {0, 1, 2, 3, 1, 4, 5, 6, 10, 9, 11};  // Corresponding bitmap index to display for each gamestate value
 const char classmap[8] = {0, 6, 1, 5, 6, 2, 4, 3}; // From model.json "S",E","N","S","I","M","L" starting from index 1
 const char classlabel[9] = "UEILMNSU";  // Value to display in serial debug console output for target and recognized gesture class
 const uint32_t LAST_GESTURE_HOLD_MSEC = 2000; //Retain display of last gesture on remote UI
-
-// Application state variables
-const char NUM_GESTURES = 7;  // Number of distinct gestures to train, including UNKNOWN (used in DCL_Mode only)
 int gestureresult = 0;
 int lastgestureresult = -1;
 uint32_t lgrstickytimer;
 uint32_t StartTime;
 uint32_t GameOverTime = 20 * 1000; // Default time limit for game is set at 20 seconds
 uint32_t secsRemaining = 0;
-uint8_t pgmMode = GAME_MODE;
 int GameState = 0;  // Primary state variable for game progression 0=Ready to Play, 1 thu 7 = gesture sequence, 8=Winner, 9=Loser
 int GameOverState = 0;  // Variable to retain furthest level acheived in game if player lost
+
+//DCL Mode declarations
+const char NUM_CLASSES = 7;  // Number of distinct gestures to train, including UNKNOWN (used in DCL_Mode only)
+char classIndex = 0;  // State variable for target gesture class during DCL Mode operation
+
+// Application state variables
+uint8_t pgmMode = GAME_MODE;
 bool resetReady = false;
-char gestureIndex = 0;  // State variable for target gesture class during DCL Mode operation
 int16_t sampleIndex = 0;
 bool isStreaming = false; // Boolean state variable for DCL_MODE streaming state
 char serialCommand[160] = ""; // Variable to hold serial commands for device settings
@@ -304,7 +310,7 @@ void DisplayTargetGesture (int gesturenum) {  // Render the appropriate bitmap R
     else {
       M5.Lcd.drawBitmap(0, 0, 240, 135, (uint16_t*)GESTURE_BMP[gesturenum]);
       Serial.print("DCL/TEST Mode > State: ");
-      Serial.println((uint8_t)gestureIndex);
+      Serial.println((uint8_t)classIndex);
     }
 }
 
@@ -408,16 +414,25 @@ int GetSensorDataSample(int samplenum) {  //get one sample frame from IMU FIFO a
     dataPacket[offset + 3] = (char)(accY >> 8 & 0xff);
     dataPacket[offset + 4] = (char)(accZ & 0xff);
     dataPacket[offset + 5] = (char)(accZ >> 8 & 0xff);
-    dataPacket[offset + 6] = (char)(gyroX & 0xff);
-    dataPacket[offset + 7] = (char)(gyroX >> 8 & 0xff);
-    dataPacket[offset + 8] = (char)(gyroY & 0xff);
-    dataPacket[offset + 9] = (char)(gyroY >> 8 & 0xff);
-    dataPacket[offset + 10] = (char)(gyroZ & 0xff);
-    dataPacket[offset + 11] = (char)(gyroZ >> 8 & 0xff);
-    char btnAState = digitalRead(BUTTON_A);
-    dataPacket[offset + 12] = (char)0;
-    dataPacket[offset + 13] = (char)(((gestureIndex << 2) * (btnAState == LOW))  & 0xff);
-    return 14;
+    if (CHANNELS_PER_SAMPLE==7) {
+      dataPacket[offset + 6] = (char)(gyroX & 0xff);
+      dataPacket[offset + 7] = (char)(gyroX >> 8 & 0xff);
+      dataPacket[offset + 8] = (char)(gyroY & 0xff);
+      dataPacket[offset + 9] = (char)(gyroY >> 8 & 0xff);
+      dataPacket[offset + 10] = (char)(gyroZ & 0xff);
+      dataPacket[offset + 11] = (char)(gyroZ >> 8 & 0xff);
+      char btnAState = digitalRead(BUTTON_A);
+      dataPacket[offset + 12] = (char)0;
+      dataPacket[offset + 13] = (char)(((classIndex << 2) * (btnAState == LOW))  & 0xff);
+      return 14;
+    }
+    if (CHANNELS_PER_SAMPLE==4) {
+      char btnAState = digitalRead(BUTTON_A);
+      dataPacket[offset + 6] = (char)0;
+      dataPacket[offset + 7] = (char)(((classIndex << 2) * (btnAState == LOW))  & 0xff);
+      return 8;
+    }
+
   }
   return 0;
 }
@@ -468,13 +483,23 @@ void ResetDCL() {
   char ratestr[7] = "";
   IPAddress ipAddr;
   
-  gestureIndex = 0;
+  classIndex = 0;
   ssfConfig = "{\"sample_rate\":";
   itoa(int(1000 / (sampleRate + 1)), ratestr, 10);
   ssfConfig += ratestr;
   ssfConfig += ",\"version\":1,\"samples_per_packet\":";
   ssfConfig += SAMPLES_PER_PACKET;
-  ssfConfig += ",\"column_location\":{\"AccelerometerX\":0,\"AccelerometerY\":1,\"AccelerometerZ\":2,\"GyroscopeX\":3,\"GyroscopeY\":4,\"GyroscopeZ\":5,\"Trigger\":6}}\r\n";
+  switch (pgmMode) {
+    case DCL_MODE:
+      CHANNELS_PER_SAMPLE = 7;
+      ssfConfig += ",\"column_location\":{\"AccelerometerX\":0,\"AccelerometerY\":1,\"AccelerometerZ\":2,\"GyroscopeX\":3,\"GyroscopeY\":4,\"GyroscopeZ\":5,\"Trigger\":6}}\r\n";
+      break;
+    case DCL_MODE_NOGYRO:
+      CHANNELS_PER_SAMPLE = 4;
+      ssfConfig += ",\"column_location\":{\"AccelerometerX\":0,\"AccelerometerY\":1,\"AccelerometerZ\":2,\"Trigger\":3}}\r\n";
+      break;
+  }
+  PACKET_SIZE = SAMPLES_PER_PACKET * CHANNELS_PER_SAMPLE;
   Serial.print("DCL Mode - SSF Header:");
   Serial.println(ssfConfig);
   M5.Lcd.setRotation(3);
@@ -550,16 +575,22 @@ void ProgramSettings() { // Display game info, IP addr, and allow editing of mas
         M5.Lcd.println("Not Connected    ");
       }
     M5.Lcd.setTextColor(WHITE,BLACK*(editParam!=0)+BLUE*(editParam==0));
-    M5.Lcd.print("Program Mode: ");
+    M5.Lcd.print("Pgm Mode: ");
     switch (pgmMode) {
       case GAME_MODE:
-        M5.Lcd.println("GAME  ");
+        M5.Lcd.println("GAME      ");
         break;
       case DCL_MODE:
-        M5.Lcd.println("DCL   ");
+        M5.Lcd.println("DCL-AccGyr");
+        break;
+      case DCL_MODE_NOGYRO:
+        M5.Lcd.println("DCL-Acc   ");
+        break;
+      case DCL_MODE_AUDIO:
+        M5.Lcd.println("DCL-Mic   ");
         break;
       case TEST_MODE:
-        M5.Lcd.println("TEST  ");
+        M5.Lcd.println("TEST      ");
         break;
     }
     if (pgmMode==GAME_MODE) {
@@ -580,7 +611,7 @@ void ProgramSettings() { // Display game info, IP addr, and allow editing of mas
     if (ButtonPressTime(BUTTON_B)>0) {
       switch (editParam) {
         case 0:
-          pgmMode = (pgmMode + 1) % 2;  // TEST mode reserved for future revision
+          pgmMode = (pgmMode + 1) % 3;  // TEST and AUDIO modes reserved for future revision
           break;
         case 1:
           if (pgmMode==GAME_MODE) {
@@ -592,6 +623,8 @@ void ProgramSettings() { // Display game info, IP addr, and allow editing of mas
           }
           break;
         case 2:
+          EEPROM.write(101,pgmMode);
+          EEPROM.commit();
           saveSettings = true;
           break;
       }
@@ -640,49 +673,49 @@ void ServiceHttpRequests(WiFiClient c) {
               httpResponse += "}";
             }
             else {
-              httpResponse = "HTTP/1.1 409 Conflict: Device not in GAME Mode\r\nContent-type:none\r\n";
+              httpResponse = "HTTP/1.1 400 Bad Request: Time value not in range.\r\nContent-type:none\r\n";
             }
           }   // if "GET /gamestatus"
         
           if (header.indexOf("GET /config") >= 0) {
-            if ((pgmMode==DCL_MODE) || (pgmMode==TEST_MODE)) {
-            httpResponse = "HTTP/1.1 200 OK\r\nContent-type:text/json\r\n\r\n";
-            httpResponse += ssfConfig;
+            if ((pgmMode==DCL_MODE) || (pgmMode==DCL_MODE_NOGYRO) || (pgmMode==TEST_MODE)) {
+              httpResponse = "HTTP/1.1 200 OK\r\nContent-type:text/json\r\n\r\n";
+              httpResponse += ssfConfig;
             }
             else {
-            httpResponse = "HTTP/1.1 409 Conflict: Device not in DCL or TEST Mode\r\nContent-type:none\r\n";
+              httpResponse = "HTTP/1.1 409 Conflict: Device not in DCL or TEST Mode\r\nContent-type:none\r\n";
             }
           }  // if "GET /config"
           
           if (header.indexOf("GET /stream") >= 0) {
-              if ((pgmMode==DCL_MODE) || (pgmMode==TEST_MODE)) {
-              isStreaming = true;
-              M5.IMU.enableFIFO((MPU6886::Fodr)sampleRate);   //Start IMU FIFO mode
-              DisplayTargetGesture(++gestureIndex);
-              httpResponse = "HTTP/1.1 200 OK\r\nContent-type:application/octet-stream\r\n";
+              if ((pgmMode==DCL_MODE) || (pgmMode==DCL_MODE_NOGYRO) || (pgmMode==TEST_MODE)) {
+                isStreaming = true;
+                M5.IMU.enableFIFO((MPU6886::Fodr)sampleRate);   //Start IMU FIFO mode
+                DisplayTargetGesture(++classIndex);
+                httpResponse = "HTTP/1.1 200 OK\r\nContent-type:application/octet-stream\r\n";
               }
               else {
-              httpResponse = "HTTP/1.1 409 Conflict: Device not in DCL or TEST Mode\r\nContent-type:none\r\n";
+                httpResponse = "HTTP/1.1 409 Conflict: Device not in DCL or TEST Mode\r\nContent-type:none\r\n";
               }
           }  // if "GET /stream"
 
           if (header.indexOf("GET /reset") >= 0) {
               if (pgmMode==GAME_MODE) {
-              ResetGame();
-              httpResponse = "HTTP/1.1 200 OK\r\nContent-type:none\r\n";
+                ResetGame();
+                httpResponse = "HTTP/1.1 200 OK\r\nContent-type:none\r\n";
               }
               else {
-              httpResponse = "HTTP/1.1 409 Conflict: Device not in GAME Mode\r\nContent-type:none\r\n";
+                httpResponse = "HTTP/1.1 409 Conflict: Device not in GAME Mode\r\nContent-type:none\r\n";
               }
           }  // if "GET /reset"
         
           if (header.indexOf("GET /disconnect") >= 0) {
-              if ((pgmMode==DCL_MODE) || (pgmMode==TEST_MODE)) {
-              isStreaming = true;
-              httpResponse = "HTTP/1.1 200 OK\r\nContent-type:application/octet-stream\r\n\r\n";
+              if ((pgmMode==DCL_MODE) || (pgmMode==DCL_MODE_NOGYRO) || (pgmMode==TEST_MODE)) {
+                isStreaming = false;
+                httpResponse = "HTTP/1.1 200 OK\r\nContent-type:application/octet-stream\r\n\r\n";
               }
               else {
-              httpResponse = "HTTP/1.1 409 Conflict: Device not in DCL or TEST Mode\r\nContent-type:none\r\n";
+                httpResponse = "HTTP/1.1 409 Conflict: Device not in DCL or TEST Mode\r\nContent-type:none\r\n";
               }
           }  // if "GET /disconnect"
 
@@ -696,7 +729,22 @@ void ServiceHttpRequests(WiFiClient c) {
               httpResponse = "HTTP/1.1 200 OK\r\nContent-type:none\r\n";
           }  // if "GET /set-game-mode"
 
-          if (header.indexOf("GET /set-dcl-mode") >= 0) {
+          int setclk = header.indexOf("GET /set-game-clock?time=");
+          if (setclk >= 0) {
+              String paramstr=header.substring(setclk+25);
+              Serial.println(paramstr);
+              int clkval = paramstr.toInt();
+              if ((clkval > 0) && (clkval < 100)) {
+                GameOverTime = clkval*1000;
+                ResetGame();
+                httpResponse = "HTTP/1.1 200 OK\r\nContent-type:none\r\n";
+              }
+              else {
+                httpResponse = "HTTP/1.1 200 OK\r\nContent-type:none\r\n";
+              }
+          }  // if "GET /set-game-clock"
+
+          if ((header.indexOf("GET /set-dcl-mode") >= 0) || (header.indexOf("GET /set-dcl-accgyr-mode") >= 0)) {
               if (pgmMode!=DCL_MODE) {
                 pgmMode = DCL_MODE;
                 EEPROM.write(101,pgmMode);
@@ -706,7 +754,16 @@ void ServiceHttpRequests(WiFiClient c) {
               httpResponse = "HTTP/1.1 200 OK\r\nContent-type:none\r\n";
           }  // if "GET /set-dcl-mode"
    
-        
+          if (header.indexOf("GET /set-dcl-acc-mode") >= 0) {
+              if (pgmMode!=DCL_MODE_NOGYRO) {
+                pgmMode = DCL_MODE_NOGYRO;
+                EEPROM.write(101,pgmMode);
+                EEPROM.commit();
+                ResetDCL();
+              }
+              httpResponse = "HTTP/1.1 200 OK\r\nContent-type:none\r\n";
+          }  // if "GET /set-dcl-mode"
+
           if (httpResponse.length()>0) {
               c.println(httpResponse);
               Serial.println(httpResponse);
@@ -827,11 +884,11 @@ void loop(){
         DisplayPixelArray(GameState);
         if (GameState == 8) { // player has made it through all gestures, declare winner
           M5.IMU.disableFIFO();
-          PlayMelody(winnermelody);
+          // PlayMelody(winnermelody);
         }  
         else {
           if (GameState > 0) {
-            PlayMelody(matchmelody);
+            // PlayMelody(matchmelody);
           }
           M5.IMU.resetFIFO(); //Flush IMU FIFO to avoid sync issues with BUTTON_A trigger channel
         }
@@ -854,7 +911,7 @@ void loop(){
         GameState = 9;
         M5.IMU.disableFIFO();
         DisplayTargetGesture(GameState);
-        PlayMelody(losermelody);
+        //PlayMelody(losermelody);
       }
     }   
   
@@ -872,7 +929,7 @@ void loop(){
         GameState++;
         DisplayTargetGesture(GameState);
         DisplayPixelArray(GameState);
-        PlayMelody(gomelody);
+        //PlayMelody(gomelody);
         StartTime = millis();
         M5.IMU.enableFIFO((MPU6886::Fodr)sampleRate);   //Start IMU FIFO mode
   
@@ -883,14 +940,14 @@ void loop(){
     }
   } // while GAME_MODE
 
-  while (pgmMode==DCL_MODE) {
+  while ((pgmMode==DCL_MODE) || (pgmMode==DCL_MODE_NOGYRO)) {
     if (isStreaming && client.connected()) {
       if (ButtonPressTime(BUTTON_B)>0) {
-        gestureIndex++;
-        if (gestureIndex>NUM_GESTURES) {
-          gestureIndex = 1;
+        classIndex++;
+        if (classIndex>NUM_CLASSES) {
+          classIndex = 1;
         }
-        DisplayTargetGesture (gestureIndex);
+        DisplayTargetGesture (classIndex);
       }
       if (GetSensorDataSample(sampleIndex) > 0) {
         sampleIndex++;
