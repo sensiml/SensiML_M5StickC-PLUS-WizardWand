@@ -1,7 +1,7 @@
 /* ------------------------------------------------------------------------------------------------------------------------------------------------------
 *   SensiML M5StickC PLUS Unified Demo Game/DCL Application - Arduino M5StickC PLUS (ESP32-PICO)
-*   Version: 1.01
-*   Date: June 5, 2023
+*   Version: 1.1
+*   Date: Sept 13, 2023
 *   Author: Chris Rogers
 *   Purpose: Example demonstrating integration of SensiML Knowledge Pack into ESP32 WiFi enabled connected IoT device application
 *            Provide multi-mode operation for raw IMU data capture mode and example gesture recognition 'Wizard Wand' game with integrated ML model
@@ -54,15 +54,16 @@
 #define DCL_MODE_AUDIO 3  //To do: Support for audio data collection
 #define TEST_MODE 10      //To do: Stream raw sensor data to DCL and KP results > Supports /config, /stream, /disconnect and /results endpoints
 #define APP_TITLE "SensiML M5StickC+ FW"
-#define APP_VERSION "Version 1.01"
+#define APP_VERSION "Version 1.1"
 
 //MPU6886 IMU sample rate declarations
 const int SAMPLE_SELECT[] = {99,19,9,7,4,3,1,0};
 int sampleRate = M5.IMU.ODR_250Hz;  // valid MStickC+ w/ FIFO modified lib are ODR_10Hz (99), ODR_50Hz (19), ODR_100Hz (9), ODR_125Hz (7), ODR_200Hz (4), ODR_250Hz (3), ODR_500Hz (1), ODR_1kHz (0)
 
 // Sensor Data Array and SSFv1 HTTP streaming format declarations
+const int PACKET_RATE = 30;   // WiFi streaming packet rate in packets/sec (impacts DCL streaming choppiness)
 int CHANNELS_PER_SAMPLE = 7;  // for applications using the onboard IMU motion sensor MPU6886 -> accel_X, accel_Y, accel_Z, gyro_x, gyro_y, gyro_Z, trigger
-int SAMPLES_PER_PACKET = 100 / (sampleRate + 1);  //Adjust samples/packet to yield 10 packets/sec stream no matter the sample rate
+int SAMPLES_PER_PACKET = 1000 / (PACKET_RATE * (sampleRate + 1));  //Adjust samples/packet to yield 10 packets/sec stream no matter the sample rate
 int PACKET_SIZE = SAMPLES_PER_PACKET * CHANNELS_PER_SAMPLE; // accelx,y,z + gyrox,y,z + target gesture class number from BtnA trigger
 char dataPacket[700 * 2];  // Define as maximum array size for 1kHz sample rate
 uint32_t packetIndex = 0;
@@ -484,6 +485,7 @@ void ResetDCL() {
   IPAddress ipAddr;
   
   classIndex = 0;
+  SAMPLES_PER_PACKET = 1000 / (PACKET_RATE * (sampleRate + 1));
   ssfConfig = "{\"sample_rate\":";
   itoa(int(1000 / (sampleRate + 1)), ratestr, 10);
   ssfConfig += ratestr;
